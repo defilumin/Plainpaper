@@ -1,3 +1,26 @@
+// This runs on Vercel's servers, NOT in the visitor's browser.
+// Your ANTHROPIC_API_KEY lives here as a secret and is never sent to the browser.
+
+// ---- Rate limiting ----
+// Allows 10 searches per IP per hour. Resets automatically every hour.
+// This is in-memory, so it resets when the server cold-starts — good enough for abuse prevention.
+const RATE_LIMIT = 10;        // max searches per window
+const WINDOW_MS = 60 * 60 * 1000; // 1 hour in milliseconds
+const ipMap = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = ipMap.get(ip);
+  if (!entry || now - entry.start > WINDOW_MS) {
+    ipMap.set(ip, { count: 1, start: now });
+    return false;
+  }
+  if (entry.count >= RATE_LIMIT) return true;
+  entry.count++;
+  return false;
+}
+
+// ---- Prompt ----
 const SYSTEM_PROMPT = `You explain cryptocurrencies clearly and completely, adapting the depth and terminology to the reader described in the user's message.
 The user's input may be misspelled, have extra/missing spaces, or be an informal name.
 ALWAYS interpret it as the closest real cryptocurrency (e.g. "bit coin cash" -> Bitcoin Cash,
@@ -46,13 +69,22 @@ export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Use POST" });
   }
+
+  // Check rate limit first
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many searches. You've hit the limit of 10 per hour — come back soon." });
+  }
+
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Add it in Vercel project settings." });
   }
+
   const term = (req.body && req.body.term ? String(req.body.term) : "").trim();
   if (!term) return res.status(400).json({ error: "No coin provided." });
   const level = (req.body && LEVELS[req.body.level]) ? req.body.level : "beginner";
+
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -69,6 +101,7 @@ export default async function handler(req, res) {
         tools: [{ type: "web_search_20250305", name: "web_search" }],
       }),
     });
+
     const data = await r.json();
     if (data.error) {
       return res.status(502).json({ error: data.error.message || "Claude request failed." });
